@@ -1,0 +1,187 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import inspect
+import os
+import re
+import tempfile
+import textwrap
+from collections.abc import Callable
+from datetime import timedelta
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from airflow.decorators.base import DecoratedOperator, TaskDecorator, task_decorator_factory
+from airflow.providers.ray.exceptions import RayJobException
+from airflow.providers.ray.operators.ray import SubmitRayJob
+
+if TYPE_CHECKING:
+    from airflow.utils.context import Context
+
+
+class _RayDecoratedOperator(DecoratedOperator, SubmitRayJob):
+    """
+    Custom Airflow operator for Ray tasks.
+
+    This operator combines the functionality of Airflow's DecoratedOperator
+    with the Ray SubmitRayJob operator, allowing users to define tasks that
+    submit jobs to a Ray cluster.
+
+    :param config: Configuration dictionary for the Ray job.
+    :param kwargs: Additional keyword arguments.
+    """
+
+    custom_operator_name = "@task.ray"
+    _config: dict[str, Any] | Callable[..., dict[str, Any]] = dict()
+
+    template_fields: Any = (*SubmitRayJob.template_fields, "op_args", "op_kwargs")
+
+    def __init__(self, config: dict[str, Any] | Callable[..., dict[str, Any]], **kwargs: Any) -> None:
+        self._config = config
+        self.kwargs = kwargs
+        super().__init__(conn_id="", entrypoint="python script.py", runtime_env={}, **kwargs)
+
+    def _build_config(self, context: Context) -> dict[str, Any]:
+        if callable(self._config):
+            config_params = inspect.signature(self._config).parameters
+            config_kwargs = {k: v for k, v in self.kwargs.items() if k in config_params and k != "context"}
+            if "context" in config_params:
+                config_kwargs["context"] = context
+            config = self._config(**config_kwargs)
+            if not isinstance(config, dict):
+                raise TypeError("Config callable must return a dict")
+            return config
+        return self._config
+
+    def _load_config(self, config: dict[str, Any]) -> None:
+        self.conn_id: str = config.get("conn_id", "")
+        self.is_decorated_function = "entrypoint" not in config
+        self.entrypoint: str = config.get("entrypoint", "python script.py")
+        self.runtime_env: dict[str, Any] = config.get("runtime_env", {})
+
+        self.num_cpus: int | float = config.get("num_cpus", 1)
+        self.num_gpus: int | float = config.get("num_gpus", 0)
+        self.memory: int | float = config.get("memory", 1)
+        self.ray_resources: dict[str, Any] | None = config.get("resources")
+        self.ray_cluster_yaml: str | None = config.get("ray_cluster_yaml")
+        self.update_if_exists: bool = config.get("update_if_exists", False)
+        self.kuberay_version: str = config.get("kuberay_version", "1.0.0")
+        self.gpu_device_plugin_yaml: str = config.get("gpu_device_plugin_yaml", "")
+        self.fetch_logs: bool = config.get("fetch_logs", True)
+        self.wait_for_completion: bool = config.get("wait_for_completion", True)
+        job_timeout_seconds = config.get("job_timeout_seconds", 600)
+        self.job_timeout_seconds: timedelta | None = (
+            timedelta(seconds=job_timeout_seconds) if job_timeout_seconds > 0 else None
+        )
+        self.poll_interval: int = config.get("poll_interval", 60)
+        self.xcom_task_key: str | None = config.get("xcom_task_key")
+
+        self.config = config
+
+        if not isinstance(self.num_cpus, (int, float)):
+            raise RayJobException("num_cpus should be an integer or float value")
+        if not isinstance(self.num_gpus, (int, float)):
+            raise RayJobException("num_gpus should be an integer or float value")
+
+    def execute(self, context: Context) -> Any:
+        """
+        Execute the Ray task.
+
+        :param context: The context in which the task is being executed.
+        :return: The result of the Ray job execution.
+        """
+        config = self._build_config(context)
+        self.log.info("Using the following config %s", config)
+        self._load_config(config)
+
+        with tempfile.TemporaryDirectory(prefix="ray_") as tmpdirname:
+            temp_dir = Path(tmpdirname)
+
+            if self.is_decorated_function:
+                self.log.info(
+                    "Entrypoint is not provided, is_decorated_function is set to %s",
+                    self.is_decorated_function,
+                )
+
+                full_source = inspect.getsource(self.python_callable)
+                function_body = self._extract_function_body(full_source)
+
+                args_str = ", ".join(repr(arg) for arg in self.op_args)
+                kwargs_str = ", ".join(f"{k}={repr(v)}" for k, v in self.op_kwargs.items())
+                call_str = f"{self.python_callable.__name__}({args_str}, {kwargs_str})"
+
+                script_filename = os.path.join(temp_dir, "script.py")
+                with open(script_filename, "w") as file:
+                    file.write(function_body)
+                    file.write(f"\n\n# Execute the function\n{call_str}\n")
+
+                self.entrypoint = f"python {os.path.basename(script_filename)}"
+                self.runtime_env["working_dir"] = temp_dir
+
+            self.log.info("Running ray job...")
+            result = super().execute(context)
+
+            return result
+
+    def _extract_function_body(self, source: str) -> str:
+        """Extract the function, excluding the task.ray or ray.task decorator."""
+        self.log.info(r"Ray pipeline intended to be executed: \n %s", source)
+        # Support both @task.ray and @ray.task decorator patterns
+        if "@task.ray" not in source and "@ray.task" not in source:
+            raise RayJobException(
+                "Unable to parse this body. Expects the `@task.ray` or `@ray.task` decorator."
+            )
+        lines = source.split("\n")
+        ray_task_line = next(
+            (i for i, line in enumerate(lines) if re.match(r"^\s*@(task\.ray|ray\.task)", line.strip())),
+            -1,
+        )
+
+        body = "\n".join(lines[:ray_task_line] + lines[ray_task_line + 1 :])
+
+        if not body:
+            raise RayJobException("Failed to extract Ray pipeline code decorated with @task.ray")
+        return textwrap.dedent(body)
+
+
+def ray_task(
+    python_callable: Callable[..., Any] | None = None,
+    multiple_outputs: bool | None = None,
+    config: dict[str, Any] | Callable[[], dict[str, Any]] | None = None,
+    **kwargs: Any,
+) -> TaskDecorator:
+    """
+    Wrap a Python callable into an Airflow operator that submits a Ray job.
+
+    Can be used as ``@task.ray()`` in DAGs. Also accepts any argument that
+    SubmitRayJob accepts via ``kwargs``.
+
+    :param python_callable: Function to decorate.
+    :param multiple_outputs: If True, return value will be unrolled to multiple XCom values.
+    :param config: A dictionary of configuration or a callable that returns a dictionary.
+    :param kwargs: Additional keyword arguments.
+    :return: The decorated task.
+    """
+    config = config or {}
+    return task_decorator_factory(
+        python_callable=python_callable,
+        multiple_outputs=multiple_outputs,
+        decorated_operator_class=_RayDecoratedOperator,
+        config=config,
+        **kwargs,
+    )

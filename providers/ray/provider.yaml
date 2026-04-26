@@ -1,0 +1,136 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+---
+package-name: apache-airflow-providers-ray
+
+name: Ray
+
+description: |
+    `Ray <https://docs.ray.io/>`__ provider for Apache Airflow.
+    Provides operators and hooks for submitting and managing Ray jobs on Kubernetes
+    clusters using the KubeRay operator.
+
+state: ready
+lifecycle: production
+source-date-epoch: 1743379200
+
+# Note that those versions are maintained by release manager - do not update them manually
+versions:
+  - 1.0.0
+
+integrations:
+  - integration-name: Ray
+    external-doc-url: https://docs.ray.io/
+    logo: /docs/integration-logos/Ray.png
+    how-to-guide:
+      - /docs/apache-airflow-providers-ray/operators/ray.rst
+    tags:
+      - distributed-computing
+      - ml
+      - ai
+      - kubernetes
+      - kuberay
+
+hooks:
+  - integration-name: Ray
+    python-modules:
+      - airflow.providers.ray.hooks.ray
+
+operators:
+  - integration-name: Ray
+    python-modules:
+      - airflow.providers.ray.operators.ray
+
+triggers:
+  - integration-name: Ray
+    python-modules:
+      - airflow.providers.ray.triggers.ray
+
+task-decorators:
+  - class-name: airflow.providers.ray.decorators.ray.ray_task
+    name: ray
+
+connection-types:
+  - hook-class-name: airflow.providers.ray.hooks.ray.RayHook
+    connection-type: ray
+    conn-fields:
+      address:
+        label: Ray dashboard URL
+        schema:
+          type:
+            - string
+            - 'null'
+        placeholder: http://ray-dashboard:8265
+      kube_config_path:
+        label: Kube config path
+        schema:
+          type:
+            - string
+            - 'null'
+        placeholder: /path/to/.kubeconfig
+      kube_config:
+        label: Kube config (JSON format)
+        is_sensitive: true
+        schema:
+          type:
+            - string
+            - 'null'
+      namespace:
+        label: Namespace
+        schema:
+          type:
+            - string
+            - 'null'
+        placeholder: default
+      cluster_context:
+        label: Cluster context
+        schema:
+          type:
+            - string
+            - 'null'
+      cookies:
+        label: Cookies
+        schema:
+          type:
+            - string
+            - 'null'
+      headers:
+        label: Headers (JSON)
+        schema:
+          type:
+            - string
+            - 'null'
+        placeholder: '{"Authorization": "Bearer token"}'
+      verify:
+        label: Verify SSL
+        schema:
+          type:
+            - boolean
+            - 'null'
+      disable_verify_ssl:
+        label: Disable SSL verification
+        schema:
+          type:
+            - boolean
+            - 'null'
+      disable_tcp_keepalive:
+        label: Disable TCP keepalive
+        schema:
+          type:
+            - boolean
+            - 'null'
