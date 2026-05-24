@@ -465,24 +465,47 @@ class RayHook(KubernetesHook):  # type: ignore[misc]
 
     def _setup_load_balancer(self, name: str, namespace: str, context: Context) -> None:
         """
-        Set up the load balancer and push URLs to XCom.
+        Set up the load balancer or ClusterIP service and push URLs to XCom.
+
+        For LoadBalancer services, waits for the external IP/hostname to become ready.
+        For ClusterIP services, uses the cluster IP directly.
 
         :param name: The name of the Ray cluster.
         :param namespace: The namespace where the cluster is deployed.
         :param context: The Airflow task context.
         """
-        lb_details: dict[str, Any] = self._wait_for_load_balancer(
-            service_name=f"{name}-head-svc", namespace=namespace
-        )
+        service_name = f"{name}-head-svc"
+        try:
+            service = self._get_service(service_name, namespace)
+        except AirflowException:
+            self.log.info("Service %s not found, skipping load balancer setup.", service_name)
+            return
 
-        if lb_details:
-            self.log.info(lb_details)
-            dns = lb_details["working_address"]
-            for port in lb_details["ports"]:
-                url = f"http://{dns}:{port['port']}"
-                context["task_instance"].xcom_push(key=port["name"], value=url)
+        service_type = service.spec.type
+        self.log.info("Service %s is of type %s", service_name, service_type)
+
+        if service_type == "LoadBalancer":
+            lb_details: dict[str, Any] = self._wait_for_load_balancer(
+                service_name=service_name, namespace=namespace
+            )
+            if lb_details:
+                self.log.info(lb_details)
+                dns = lb_details["working_address"]
+                for port in lb_details["ports"]:
+                    url = f"http://{dns}:{port['port']}"
+                    context["task_instance"].xcom_push(key=port["name"], value=url)
+            else:
+                self.log.info("No URLs to push to XCom.")
         else:
-            self.log.info("No URLs to push to XCom.")
+            # ClusterIP or NodePort — use the clusterIP directly
+            cluster_ip = service.spec.cluster_ip
+            if cluster_ip:
+                self.log.info("Using ClusterIP %s for service %s", cluster_ip, service_name)
+                for port in service.spec.ports:
+                    url = f"http://{cluster_ip}:{port.port}"
+                    context["task_instance"].xcom_push(key=port.name, value=url)
+            else:
+                self.log.info("No ClusterIP available for service %s.", service_name)
 
     def setup_ray_cluster(
         self,
